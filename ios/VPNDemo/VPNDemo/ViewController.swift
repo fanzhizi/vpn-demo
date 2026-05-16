@@ -1,14 +1,13 @@
 import UIKit
 import NetworkExtension
 
-/// Simple ViewController as a fallback if Slint is not available.
-/// In production, the Slint UI would be the primary interface.
 class ViewController: UIViewController {
 
     private let addressField = UITextField()
     private let connectButton = UIButton(type: .system)
     private let statusLabel = UILabel()
     private let statusDot = UIView()
+    private let logLabel = UILabel()
 
     private var isConnected = false
 
@@ -21,23 +20,19 @@ class ViewController: UIViewController {
 
     private func setupUI() {
         view.backgroundColor = .systemBackground
-        title = "VPN Demo"
 
-        // Title
         let titleLabel = UILabel()
         titleLabel.text = "iOS VPN Demo"
         titleLabel.font = .systemFont(ofSize: 24, weight: .bold)
         titleLabel.textAlignment = .center
 
-        // Address input
         addressField.placeholder = "SOCKS5 address (e.g. 1.2.3.4:1080)"
-        addressField.text = "127.0.0.1:1080"
+        addressField.text = "192.168.31.209:1080"
         addressField.borderStyle = .roundedRect
         addressField.autocapitalizationType = .none
         addressField.autocorrectionType = .no
         addressField.keyboardType = .numbersAndPunctuation
 
-        // Status
         statusDot.backgroundColor = .systemRed
         statusDot.layer.cornerRadius = 6
         statusDot.translatesAutoresizingMaskIntoConstraints = false
@@ -54,15 +49,24 @@ class ViewController: UIViewController {
         statusStack.spacing = 8
         statusStack.alignment = .center
 
-        // Button
         connectButton.setTitle("Connect VPN", for: .normal)
         connectButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .semibold)
         connectButton.addTarget(self, action: #selector(toggleVPN), for: .touchUpInside)
 
-        // Layout
-        let stack = UIStackView(arrangedSubviews: [titleLabel, addressField, statusStack, connectButton])
+        let testButton = UIButton(type: .system)
+        testButton.setTitle("Test SOCKS5", for: .normal)
+        testButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        testButton.addTarget(self, action: #selector(testSocks5), for: .touchUpInside)
+
+        logLabel.text = ""
+        logLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        logLabel.textColor = .secondaryLabel
+        logLabel.numberOfLines = 0
+        logLabel.textAlignment = .center
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, addressField, statusStack, connectButton, testButton, logLabel])
         stack.axis = .vertical
-        stack.spacing = 20
+        stack.spacing = 16
         stack.alignment = .center
         stack.translatesAutoresizingMaskIntoConstraints = false
 
@@ -71,13 +75,26 @@ class ViewController: UIViewController {
             stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             addressField.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.8),
+            logLabel.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.9),
         ])
     }
 
+    private func appendLog(_ msg: String) {
+        DispatchQueue.main.async {
+            let current = self.logLabel.text ?? ""
+            let lines = current.split(separator: "\n").suffix(5)
+            self.logLabel.text = (lines + [Substring(msg)]).joined(separator: "\n")
+        }
+        print("[VPNDemo] \(msg)")
+    }
+
     private func setupVPN() {
-        VPNManager.shared.loadConfiguration { error in
+        appendLog("Loading VPN config...")
+        VPNManager.shared.loadConfiguration { [weak self] error in
             if let error = error {
-                print("Failed to load VPN config: \(error)")
+                self?.appendLog("Load error: \(error.localizedDescription)")
+            } else {
+                self?.appendLog("VPN config loaded")
             }
         }
     }
@@ -95,6 +112,7 @@ class ViewController: UIViewController {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let status = VPNManager.shared.status
+            self.appendLog("VPN status: \(status.rawValue)")
             switch status {
             case .connected:
                 self.statusDot.backgroundColor = .systemGreen
@@ -120,19 +138,39 @@ class ViewController: UIViewController {
 
     @objc private func toggleVPN() {
         if isConnected {
+            appendLog("Stopping VPN...")
             VPNManager.shared.stopVPN()
         } else {
-            let address = addressField.text ?? "127.0.0.1:1080"
+            let address = addressField.text ?? "192.168.31.209:1080"
+            appendLog("Configuring VPN with \(address)...")
             VPNManager.shared.configureVPN(socks5Address: address) { [weak self] error in
                 if let error = error {
-                    print("Config error: \(error)")
+                    self?.appendLog("Config error: \(error.localizedDescription)")
                     return
                 }
+                self?.appendLog("Config saved, starting tunnel...")
                 do {
                     try VPNManager.shared.startVPN(socks5Address: address)
+                    self?.appendLog("startVPNTunnel called OK")
                 } catch {
-                    print("Start error: \(error)")
+                    self?.appendLog("Start error: \(error.localizedDescription)")
                 }
+            }
+        }
+    }
+
+    @objc private func testSocks5() {
+        let address = addressField.text ?? ""
+        appendLog("Testing SOCKS5: \(address)...")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 2048)
+            let result = address.withCString { ptr in
+                tunnel_test_socks5(ptr, &buf, buf.count)
+            }
+            let msg = String(cString: buf.map { CChar(bitPattern: $0) })
+            DispatchQueue.main.async {
+                self?.appendLog("Test result(\(result)): \(msg)")
             }
         }
     }

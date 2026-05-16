@@ -1,7 +1,6 @@
 import Foundation
 import NetworkExtension
 
-/// Manages the VPN tunnel lifecycle using NETunnelProviderManager.
 class VPNManager {
 
     static let shared = VPNManager()
@@ -10,21 +9,19 @@ class VPNManager {
 
     private init() {}
 
-    /// Load or create the VPN configuration.
     func loadConfiguration(completion: @escaping (Error?) -> Void) {
         NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
             if let error = error {
                 completion(error)
                 return
             }
-
-            // Use existing or create new
             self?.manager = managers?.first ?? NETunnelProviderManager()
             completion(nil)
         }
     }
 
-    /// Configure and save the VPN profile.
+    /// Configure VPN tunnel. The serverAddress is just a display label for iOS,
+    /// the actual SOCKS5 forwarding happens internally in the tunnel extension.
     func configureVPN(socks5Address: String, completion: @escaping (Error?) -> Void) {
         guard let manager = manager else {
             completion(NSError(domain: "VPNManager", code: -1,
@@ -33,9 +30,11 @@ class VPNManager {
         }
 
         let proto = NETunnelProviderProtocol()
-        // Bundle ID of the Network Extension target
-        proto.providerBundleIdentifier = "com.vpndemo.app.tunnel"
-        proto.serverAddress = socks5Address
+        proto.providerBundleIdentifier = "com.vpndemo.app.VPNDemo.tunnel"
+        // serverAddress is required by iOS but it's just a label,
+        // the real proxy work happens inside our tunnel extension via tun2socks
+        proto.serverAddress = "TUN2SOCKS Local Tunnel"
+        // Pass the SOCKS5 address to the extension internally
         proto.providerConfiguration = [
             "socks5_address": socks5Address
         ]
@@ -49,14 +48,12 @@ class VPNManager {
                 completion(error)
                 return
             }
-            // Reload after save
             manager.loadFromPreferences { error in
                 completion(error)
             }
         }
     }
 
-    /// Start the VPN tunnel.
     func startVPN(socks5Address: String) throws {
         guard let manager = manager else {
             throw NSError(domain: "VPNManager", code: -1,
@@ -64,21 +61,16 @@ class VPNManager {
         }
 
         let session = manager.connection as! NETunnelProviderSession
-
-        let options: [String: NSObject] = [
+        // Pass SOCKS5 address as startup option to the extension process
+        try session.startVPNTunnel(options: [
             "socks5_address": socks5Address as NSObject
-        ]
-
-        try session.startVPNTunnel(options: options)
+        ])
     }
 
-    /// Stop the VPN tunnel.
     func stopVPN() {
-        guard let manager = manager else { return }
-        manager.connection.stopVPNTunnel()
+        manager?.connection.stopVPNTunnel()
     }
 
-    /// Get current VPN status.
     var status: NEVPNStatus {
         return manager?.connection.status ?? .invalid
     }
