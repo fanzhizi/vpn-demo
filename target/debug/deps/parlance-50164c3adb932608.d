@@ -1,0 +1,13 @@
+/Users/hello/codes/rust/vpn-demo/target/debug/deps/parlance-50164c3adb932608.d: /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/lib.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/bidi.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/font.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/font_family.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/generic_family.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/language.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/script.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/tag.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/text.rs
+
+/Users/hello/codes/rust/vpn-demo/target/debug/deps/libparlance-50164c3adb932608.rmeta: /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/lib.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/bidi.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/font.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/font_family.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/generic_family.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/language.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/script.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/tag.rs /Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/text.rs
+
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/lib.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/bidi.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/font.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/font_family.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/generic_family.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/language.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/script.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/tag.rs:
+/Users/hello/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parlance-0.1.0/src/text.rs:

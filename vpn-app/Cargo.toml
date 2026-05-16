@@ -1,0 +1,11 @@
+[package]
+name = "vpn-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slint = "1.9"
+tunnel-core = { path = "../tunnel-core" }
+
+[build-dependencies]
+slint-build = "1.9"

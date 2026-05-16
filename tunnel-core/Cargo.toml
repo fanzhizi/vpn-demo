@@ -1,0 +1,16 @@
+[package]
+name = "tunnel-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+smoltcp = { version = "0.11", default-features = false, features = ["medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "alloc"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+fast-socks5 = "1"
+log = "0.4"
+oslog = "0.2"
+once_cell = "1"
+parking_lot = "0.12"

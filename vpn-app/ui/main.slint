@@ -1,0 +1,75 @@
+import { Button, LineEdit, VerticalBox, HorizontalBox, GroupBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "VPN Demo";
+    preferred-width: 320px;
+    preferred-height: 280px;
+
+    in-out property <string> socks5-address: "127.0.0.1:1080";
+    in-out property <bool> connected: false;
+    in-out property <string> status-text: "Disconnected";
+
+    callback connect-clicked(string);
+    callback disconnect-clicked();
+
+    VerticalBox {
+        alignment: center;
+        padding: 20px;
+        spacing: 16px;
+
+        Text {
+            text: "iOS VPN Demo";
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        GroupBox {
+            title: "SOCKS5 Proxy Server";
+
+            VerticalBox {
+                padding: 8px;
+                spacing: 8px;
+
+                LineEdit {
+                    placeholder-text: "ip:port (e.g. 1.2.3.4:1080)";
+                    text <=> socks5-address;
+                    enabled: !connected;
+                }
+            }
+        }
+
+        // Status indicator
+        HorizontalBox {
+            alignment: center;
+            spacing: 8px;
+
+            Rectangle {
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: connected ? #4caf50 : #f44336;
+            }
+
+            Text {
+                text: status-text;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+        }
+
+        // Connect/Disconnect button
+        Button {
+            text: connected ? "Disconnect" : "Connect VPN";
+            primary: !connected;
+
+            clicked => {
+                if (connected) {
+                    disconnect-clicked();
+                } else {
+                    connect-clicked(socks5-address);
+                }
+            }
+        }
+    }
+}
