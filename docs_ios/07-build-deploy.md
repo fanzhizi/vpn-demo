@@ -619,3 +619,131 @@ Rust 静态库是体积的主要来源。如果对体积有严格要求，可以
    cargo install cargo-bloat
    cargo bloat --release --target aarch64-apple-ios -n 20
    ```
+
+---
+
+## 7.8 Mac Catalyst 支持
+
+Mac Catalyst 允许 iOS app 直接在 macOS 上运行，复用同一套 Swift 代码和 NE Extension。但有几个关键差异需要处理。
+
+### 为什么同一套代码不能直接在 Mac 上跑
+
+iOS app 在 Mac Catalyst 模式下运行时，macOS 对 App Sandbox 有**强制要求**，而 iOS 上没有这个要求：
+
+| 差异 | iOS | Mac Catalyst |
+|---|---|---|
+| App Sandbox | 不需要（iOS 自带沙盒） | **必须显式声明** |
+| 网络权限 | 默认允许 | **必须声明 `network.client`** |
+| Rust 编译目标 | `aarch64-apple-ios` | `aarch64-apple-ios-macabi`（专用 ABI） |
+| 库格式 | `.a` (staticlib) | `.a` (staticlib)，但 ABI 不同 |
+
+### Entitlements 差异
+
+iOS 上只需要 Network Extension entitlement：
+
+```xml
+<!-- iOS 上只需这些 -->
+<key>com.apple.developer.networking.networkextension</key>
+<array>
+    <string>packet-tunnel-provider</string>
+</array>
+```
+
+Mac Catalyst 上还需要额外的 App Sandbox 权限，否则 PacketTunnel Extension **静默失败**（不崩溃、无日志，只显示 "internal error"）：
+
+```xml
+<!-- Mac Catalyst 必须添加 -->
+<key>com.apple.security.app-sandbox</key>
+<true/>
+<key>com.apple.security.network.client</key>
+<true/>
+<key>com.apple.security.network.server</key>
+<true/>
+
+<!-- 原有的 NE 权限 -->
+<key>com.apple.developer.networking.networkextension</key>
+<array>
+    <string>packet-tunnel-provider</string>
+</array>
+```
+
+**这些 entitlements 在 iOS 上是无害的**（iOS 忽略 sandbox 相关的 key），所以可以直接添加到两个 target 的 `.entitlements` 文件中，不需要条件编译。
+
+### Rust 编译目标
+
+Mac Catalyst 有自己的 target triple，不能用普通 macOS 或 iOS 的库：
+
+```
+aarch64-apple-ios        → iOS 真机
+aarch64-apple-ios-sim    → iOS 模拟器
+aarch64-apple-darwin     → 原生 macOS（不能用于 Catalyst！）
+aarch64-apple-ios-macabi → Mac Catalyst ← 必须用这个
+```
+
+如果错误地链接了 `aarch64-apple-darwin` 的库，链接器会报错：
+
+```
+ld: building for 'macCatalyst', but linking in object file built for 'macOS'
+```
+
+如果错误地链接了 `.dylib`（因为 `crate-type` 包含 `cdylib`），运行时会崩溃：
+
+```
+Library not loaded: libtunnel_core.dylib
+```
+
+### 解决方案：per-SDK Library Search Paths
+
+在 Xcode 的 Build Settings 中，使用条件化的 `LIBRARY_SEARCH_PATHS`：
+
+```
+LIBRARY_SEARCH_PATHS[sdk=iphoneos*]         = .../target/aarch64-apple-ios/release
+LIBRARY_SEARCH_PATHS[sdk=macosx*]           = .../target/aarch64-apple-ios-macabi/release
+LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]  = .../target/aarch64-apple-ios-sim/release
+```
+
+### 完整构建命令
+
+```bash
+# 1. 编译所有 target 的 Rust 库
+rustup target add aarch64-apple-ios-macabi
+cargo build --package tunnel-core --release --target aarch64-apple-ios          # iOS
+cargo build --package tunnel-core --release --target aarch64-apple-ios-macabi   # Mac Catalyst
+cargo build --package tunnel-core --release --target aarch64-apple-ios-sim      # 模拟器
+
+# 2. 删除 dylib（防止 Xcode 优先链接动态库导致崩溃）
+rm -f target/aarch64-apple-ios-macabi/release/libtunnel_core.dylib
+
+# 3. 构建 Mac Catalyst 版
+xcodebuild -scheme VPNDemo \
+    -destination 'platform=macOS,variant=Mac Catalyst,arch=arm64' \
+    -allowProvisioningUpdates build
+```
+
+### 设备注册
+
+Mac Catalyst 构建需要在 Apple Developer Portal 注册 Mac 设备：
+1. 获取 Hardware UUID：`ioreg -d2 -c IOPlatformExpertDevice | awk -F\" '/IOPlatformUUID/{print $(NF-1)}'`
+2. 登录 https://developer.apple.com/account/resources/devices/list
+3. 添加设备：Platform = macOS，Device ID = Hardware UUID
+
+### 调试技巧
+
+Mac Catalyst 的 NE Extension 日志可以通过 macOS 的 `log` 命令查看：
+
+```bash
+# 实时查看 NE 相关日志
+/usr/bin/log stream --predicate 'eventMessage CONTAINS "VPN Demo" OR process CONTAINS "PacketTunnel"' --info --debug
+
+# 查看最近 5 分钟的日志
+/usr/bin/log show --last 5m --predicate 'eventMessage CONTAINS "VPN Demo"' --info --debug
+```
+
+常见错误信息及原因：
+
+| 错误 | 原因 |
+|---|---|
+| `Plugin failed` | Extension 加载失败，通常是 entitlements 问题 |
+| `internal error occurred` | 缺少 App Sandbox entitlements |
+| `building for macCatalyst, but linking for macOS` | 链接了错误 target 的 `.a` |
+| `Library not loaded: libtunnel_core.dylib` | `cdylib` 生成了 `.dylib`，需要删除 |
