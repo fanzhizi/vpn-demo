@@ -19,8 +19,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Windows app
-        run: cargo build --package vpn-demo-windows --release
+      - name: Build Windows app (MSVC, static CRT)
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --package vpn-demo-windows --release --target x86_64-pc-windows-msvc
 
       - name: Download wintun.dll
         run: |
@@ -33,8 +35,8 @@ jobs:
 
       - name: Build installer
         run: |
-          Copy-Item "target/release/vpn-demo-windows.exe" "windows-app/installer/"
-          Copy-Item "target/release/wintun.dll" "windows-app/installer/"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/vpn-demo-windows.exe" "windows-app/installer/"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/wintun.dll" "windows-app/installer/"
           & "C:\Program Files (x86)\NSIS\makensis.exe" "windows-app/installer/installer.nsi"
 
       - name: Upload installer
@@ -48,5 +50,5 @@ jobs:
         with:
           name: VPNDemo-Windows-Portable
           path: |
-            target/release/vpn-demo-windows.exe
-            target/release/wintun.dll
+            target/x86_64-pc-windows-msvc/release/vpn-demo-windows.exe
+            target/x86_64-pc-windows-msvc/release/wintun.dll
