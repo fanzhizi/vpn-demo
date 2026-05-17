@@ -465,7 +465,7 @@ tokio::spawn(async move {
 
 ### 什么是路由回环
 
-当 VPN 隧道启用后，`NEIPv4Route.default()`（即 `0.0.0.0/0`）会把**所有流量**路由到 TUN 网卡。这包括我们自己要连接 SOCKS5 服务器的流量！
+当 VPN 启用 `0.0.0.0/0` 默认路由后，**所有流量**被路由到 TUN 网卡。如果代理客户端自身连接代理服务器的流量也被 TUN 捕获，就会形成回环：
 
 ```
 App 发起请求
@@ -481,50 +481,56 @@ TUN 截获 → tunnel-core 处理
 无限循环 → 网络死锁
 ```
 
-### 解决方案：excludedRoutes
+### iOS 的解决方案：系统级进程隔离（无需任何代码）
 
-在 `PacketTunnelProvider.swift` 中，我们将 SOCKS5 服务器的 IP 从 VPN 路由中排除：
+iOS 的 `NEPacketTunnelProvider` 运行在**独立的系统扩展进程**中。iOS 内核对这个进程做了特殊处理：**Extension 进程自身发起的 socket 连接默认走物理网卡，不经过 TUN**。
+
+这意味着：
+- Rust tunnel-core 中的 `TcpStream::connect(socks5_addr)` → 自动走物理网卡 ✓
+- Rust tunnel-core 中的 `UdpSocket::send_to(dns_server)` → 自动走物理网卡 ✓
+- **不需要任何额外代码**，不需要 `excludedRoutes`，不需要 `protect(fd)`
+
+这是 iOS 和 Android 在 VPN 架构上的**本质区别**。leaf、Surge、Shadowrocket 等所有 iOS VPN 客户端都依赖这个系统级隔离，iOS 端没有任何 `protect_socket` 代码。
+
+### Android 的解决方案：`VpnService.protect(fd)`
+
+Android 上 `VpnService` 运行在 App 主进程中，所有 socket 都会被自己的 TUN 捕获。必须对代理相关的 socket 显式调用 `protect(fd)`：
+
+```rust
+// Android: 必须在 connect 之前 protect
+let sock = socket2::Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+protect_socket(sock.as_raw_fd());  // JNI 回调 VpnService.protect(fd)
+sock.connect(&socks5_addr)?;       // 现在 connect 绕过 VPN
+```
+
+`protect(fd)` 通过 JNI 回调到 Java 层的 `VpnService.protect(int fd)`，告诉 Android 内核这个 socket 不走 VPN 路由。详见 `tunnel-core/src/ffi.rs` 中的 `android_protect` 模块。
+
+### 平台对比
+
+| | iOS | Android |
+|---|---|---|
+| 回环防护 | **系统自动**（NE 进程隔离） | **手动 protect(fd)** |
+| 代码量 | 0 行 | ~80 行（JNI + socket2） |
+| protect 时机 | 不需要 | socket 创建后、connect 之前 |
+| 影响范围 | 进程级（整个 Extension 进程） | fd 级（单个 socket） |
+
+### excludedRoutes 的正确用途
+
+`excludedRoutes` **不是**用来解决回环问题的。它用于 **split tunneling**（分流），即让某些目标地址的流量绕过 VPN：
 
 ```swift
-let ipv4 = NEIPv4Settings(addresses: ["10.0.0.2"], subnetMasks: ["255.255.255.0"])
-ipv4.includedRoutes = [NEIPv4Route.default()]  // 所有流量走 TUN
-
-// 关键：排除 SOCKS5 服务器 IP
-if let host = socks5Address.split(separator: ":").first {
-    let excludeRoute = NEIPv4Route(
-        destinationAddress: String(host),      // "192.168.31.209"
-        subnetMask: "255.255.255.255"          // /32 — 精确匹配单个 IP
-    )
-    ipv4.excludedRoutes = [excludeRoute]
-    os_log("Excluding route: %{public}@", log: self.log, type: .info, String(host))
-}
+// 仅在需要分流时使用
+ipv4.excludedRoutes = [
+    NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0"),  // 局域网直连
+    NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),       // 内网直连
+]
 ```
 
-排除后的路由行为：
-
-```
-App 发起请求 google.com
-    ↓ (匹配 0.0.0.0/0)
-TUN → tunnel-core → SOCKS5 客户端
-    ↓ (连接 192.168.31.209)
-    ↓ (匹配 excludedRoute 192.168.31.209/32)
-直接走物理网卡 → SOCKS5 服务器 ✓  不回环了！
-```
-
-### 子网掩码 255.255.255.255 的含义
-
-`/32` 子网掩码表示精确匹配一个 IP 地址。这是最精确的排除方式，只排除 SOCKS5 服务器这一个 IP，其他流量仍然走 VPN。
-
-### 需要排除的其他场景
-
-在更复杂的场景中，可能还需要排除：
-
-| 场景 | 需要排除的地址 |
+| 场景 | 使用 excludedRoutes |
 |---|---|
-| SOCKS5 服务器 | 服务器 IP/32 |
-| 局域网设备 | 192.168.0.0/16（如需局域网直连） |
-| 多个代理服务器 | 每个服务器 IP/32 |
-| IPv6 代理 | 需要在 `NEIPv6Settings` 中单独配置 |
+| 代理服务器自身连接 | ❌ 不需要（系统级隔离已处理） |
+| 内网/局域网直连 | ✅ 排除内网网段 |
+| 国内 IP 直连 | ✅ 配合 GeoIP 排除国内网段 |
 
 ---
 

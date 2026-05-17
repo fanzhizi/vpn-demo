@@ -176,11 +176,7 @@ let ipv4 = NEIPv4Settings(
 // includedRoutes: 哪些流量走 TUN
 ipv4.includedRoutes = [NEIPv4Route.default()]  // default() = 0.0.0.0/0 = 所有流量
 
-// excludedRoutes: 哪些流量不走 TUN（重要！）
-ipv4.excludedRoutes = [
-    NEIPv4Route(destinationAddress: "192.168.31.209", subnetMask: "255.255.255.255")
-    // SOCKS5 服务器的 IP 必须排除，否则形成路由回环！
-]
+// 注意：不需要 excludedRoutes 来排除代理服务器 IP！（详见下文）
 
 settings.ipv4Settings = ipv4
 
@@ -195,38 +191,77 @@ setTunnelNetworkSettings(settings) { error in
 }
 ```
 
-### 路由回环问题
+### excludedRoutes 的用途
 
-这是 VPN 开发中最常见的坑：
+`excludedRoutes` **不是**用来防止代理服务器连接回环的（那是 Android 的思路）。在 iOS 上它用于 **split tunneling**（分流）：
 
-```
-App 请求 google.com
-    → DNS 查询发到 TUN
-    → 我们的代码要通过 SOCKS5 代理发送
-    → 连接 SOCKS5 服务器 (192.168.31.209:1080)
-    → 这个连接也被路由到 TUN !!!
-    → 又要通过 SOCKS5 发送...
-    → 无限循环 → 网络瘫痪
+```swift
+// 仅在需要分流时使用，例如让内网地址绕过 VPN
+ipv4.excludedRoutes = [
+    NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0"),  // 内网直连
+    NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),       // 内网直连
+]
 ```
 
-**解决方案**：通过 `excludedRoutes` 将 SOCKS5 服务器的 IP 排除在 VPN 路由之外，让它走物理网卡。
+### iOS 不存在路由回环问题
+
+这是 iOS 和 Android 在 VPN 架构上的**本质区别**。在 Android 上，VPN 代码如果不调用 `protect(fd)`，自身的出站连接会被 TUN 捕获，形成回环。但 iOS 上这个问题**天然不存在**：
+
+```
+iOS NE Extension 进程发起的网络连接
+    → iOS 内核检测到：这是 Tunnel Provider 进程自身的流量
+    → 自动走物理网卡，不经过 TUN
+    → 不会回环 ✓
+```
+
+**原因**：`NEPacketTunnelProvider` 运行在一个独立的系统扩展进程中，iOS 内核对这个进程做了特殊处理——它发起的标准网络连接（BSD socket / `NWConnection` / `URLSession` 等）默认走物理网卡，不会被自己创建的 TUN 虚拟网卡捕获。
+
+这意味着我们在 Extension 进程中用 Rust 的 `tokio::net::TcpStream::connect()` 连接 SOCKS5 服务器，这个连接**自动绕过 VPN**，无需任何额外处理。
+
+### 与 Android 的对比
+
+| 需求 | Android | iOS |
+|---|---|---|
+| VPN 自身的出站 socket 不走 TUN | 需要 `VpnService.protect(fd)` | **系统自动**，NE 进程默认走物理网卡 |
+| 按目标 IP 分流（split tunneling） | `addRoute()` 路由配置 | `excludedRoutes` / `includedRoutes` |
+| 按 App 分流 | `addDisallowedApplication()` | Per-App VPN（仅 MDM 管理场景） |
+| 代码复杂度 | ~80 行（JNI + socket2 + protect） | 零（什么都不用做） |
+
+### Extension 进程中的网络 API
+
+在 `NEPacketTunnelProvider` 中建立网络连接，有两类 API：
+
+```swift
+// ❶ 走物理网卡（默认行为）— 用于连接代理服务器
+let connection = NWConnection(host: "proxy.example.com", port: 1080, using: .tcp)
+// 或者直接用 BSD socket / Rust 的 TcpStream::connect()
+// 这些连接不会被 TUN 捕获
+
+// ❷ 走 TUN 虚拟网卡（显式指定）— 极少使用
+let tunnelConn = createTCPConnectionThroughTunnel(to: endpoint, enableTLS: false, ...)
+// 这个连接会被路由回 TUN，通常不是你想要的
+```
+
+> **leaf 项目的做法**：iOS 端没有任何 `protect_socket` 代码（`#[cfg(target_os = "android")]` only），完全依赖 NE 进程的系统级隔离。这是所有 iOS VPN 客户端（Surge、Shadowrocket、Clash for iOS 等）的标准做法。
 
 ---
 
 ## 1.5 Extension 与主 App 的进程隔离
 
-这是 iOS Network Extension 开发中最需要理解的概念：
+这是 iOS Network Extension 开发中最需要理解的概念，也是 **iOS 不需要 `protect()` 的根本原因**：
 
 ```
-┌─────────────────────┐    ┌─────────────────────────┐
-│     主 App 进程       │    │   Extension 进程          │
-│                     │    │                          │
-│  ViewController     │    │  PacketTunnelProvider    │
-│  VPNManager         │    │  tunnel-core (Rust)      │
-│                     │    │  netstack-smoltcp        │
-│  没有网络处理能力      │    │  SOCKS5 转发             │
-│  只负责 UI 和配置     │    │                          │
-└──────────┬──────────┘    └──────────┬───────────────┘
+┌─────────────────────┐    ┌─────────────────────────────────┐
+│     主 App 进程       │    │   Extension 进程 (系统特殊对待)    │
+│                     │    │                                  │
+│  ViewController     │    │  PacketTunnelProvider            │
+│  VPNManager         │    │  tunnel-core (Rust)              │
+│                     │    │  netstack-smoltcp                │
+│  没有网络处理能力      │    │  SOCKS5 转发                     │
+│  只负责 UI 和配置     │    │                                  │
+│                     │    │  ⚡ 此进程发起的 socket 连接       │
+│                     │    │     自动走物理网卡，不经过 TUN      │
+└──────────┬──────────┘    └──────────┬───────────────────────┘
            │                          │
            │    NETunnelProvider       │
            │    Manager (IPC)          │
@@ -242,6 +277,17 @@ App 请求 google.com
 | 内存限制 | 宽松 | **严格（约 15-50 MB）** |
 | 数据共享 | 直接访问 | 需通过 App Group |
 | 职责 | UI、配置 VPN | 实际的网络数据处理 |
+| 出站网络 | 走 TUN（被 VPN 捕获） | **走物理网卡**（系统级隔离） |
+
+### 进程隔离带来的 socket 保护
+
+这个进程隔离设计意味着：
+- 主 App 进程的网络流量 → 被 TUN 捕获 → 由 Extension 处理
+- Extension 进程的网络流量 → **直接走物理网卡** → 不被 TUN 捕获
+
+这就是为什么 iOS 不需要 Android 的 `protect(fd)` 机制。Rust tunnel-core 在 Extension 进程中通过 `TcpStream::connect()` 连接 SOCKS5 服务器，iOS 内核自动让这个连接绕过 TUN。
+
+对比 Android：VpnService 运行在 App 主进程中，所有 socket 都会被自己的 TUN 捕获，所以必须对代理相关的 socket 调用 `protect(fd)` 来豁免。
 
 ### 通信方式
 
