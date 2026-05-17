@@ -2,15 +2,17 @@ import { Button, LineEdit, VerticalBox, HorizontalBox, GroupBox } from "std-widg
 
 export component MainWindow inherits Window {
     title: "VPN Demo";
-    preferred-width: 320px;
-    preferred-height: 280px;
+    preferred-width: 380px;
+    preferred-height: 360px;
 
-    in-out property <string> socks5-address: "127.0.0.1:1080";
+    in-out property <string> socks5-address: "192.168.31.209:1080";
     in-out property <bool> connected: false;
     in-out property <string> status-text: "Disconnected";
+    in-out property <string> log-text: "";
 
     callback connect-clicked(string);
     callback disconnect-clicked();
+    callback test-clicked(string);
 
     VerticalBox {
         alignment: center;
@@ -18,7 +20,7 @@ export component MainWindow inherits Window {
         spacing: 16px;
 
         Text {
-            text: "iOS VPN Demo";
+            text: "VPN Demo";
             font-size: 22px;
             font-weight: 700;
             horizontal-alignment: center;
@@ -26,11 +28,9 @@ export component MainWindow inherits Window {
 
         GroupBox {
             title: "SOCKS5 Proxy Server";
-
             VerticalBox {
                 padding: 8px;
                 spacing: 8px;
-
                 LineEdit {
                     placeholder-text: "ip:port (e.g. 1.2.3.4:1080)";
                     text <=> socks5-address;
@@ -39,18 +39,15 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Status indicator
         HorizontalBox {
             alignment: center;
             spacing: 8px;
-
             Rectangle {
                 width: 12px;
                 height: 12px;
                 border-radius: 6px;
                 background: connected ? #4caf50 : #f44336;
             }
-
             Text {
                 text: status-text;
                 font-size: 14px;
@@ -58,18 +55,35 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Connect/Disconnect button
-        Button {
-            text: connected ? "Disconnect" : "Connect VPN";
-            primary: !connected;
+        HorizontalBox {
+            alignment: center;
+            spacing: 12px;
 
-            clicked => {
-                if (connected) {
-                    disconnect-clicked();
-                } else {
-                    connect-clicked(socks5-address);
+            Button {
+                text: connected ? "Disconnect" : "Connect VPN";
+                primary: !connected;
+                clicked => {
+                    if (connected) {
+                        disconnect-clicked();
+                    } else {
+                        connect-clicked(socks5-address);
+                    }
                 }
             }
+
+            Button {
+                text: "Test SOCKS5";
+                clicked => {
+                    test-clicked(socks5-address);
+                }
+            }
+        }
+
+        Text {
+            text: log-text;
+            font-size: 11px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
         }
     }
 }
