@@ -14,7 +14,12 @@ env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
-ctrlc = "3"
+socket2 = "0.5"
+windows = { version = "0.58", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 [build-dependencies]
 slint-build = "1.9"

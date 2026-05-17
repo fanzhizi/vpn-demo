@@ -89,9 +89,8 @@ fn start_vpn(socks5_addr: &str, running: Arc<AtomicBool>) -> Result<(), Box<dyn 
 
     #[cfg(windows)]
     {
-        let socks5_host = socket_addr.ip().to_string();
         let mut config = tun::win::TunConfig::default();
-        config.excluded_ips.push(socks5_host);
+        config.socks5_host = socket_addr.ip().to_string();
         tun::win::start_tun(config, running.clone(), tun_tx, stack_rx)?;
     }
 
@@ -214,6 +213,45 @@ async fn run_netstack(
 
 async fn handle_tcp(mut local: netstack_smoltcp::TcpStream, dst: SocketAddr, socks5: SocketAddr) -> std::io::Result<()> {
     use fast_socks5::client::{Config, Socks5Stream};
+
+    // Windows: 绑定到物理网卡 IP，防止 SOCKS5 连接走 TUN 回环
+    #[cfg(windows)]
+    {
+        use std::net::TcpStream as StdTcpStream;
+
+        if let Some(bind_ip) = tun::win::get_bind_address() {
+            let bind_addr: SocketAddr = format!("{}:0", bind_ip).parse().unwrap();
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.bind(&socket2::SockAddr::from(bind_addr))?;
+            socket.connect(&socket2::SockAddr::from(socks5))?;
+            socket.set_nonblocking(true)?;
+
+            let std_stream: StdTcpStream = socket.into();
+            let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+
+            let mut socks5_stream = fast_socks5::client::Socks5Stream::use_stream(
+                tokio_stream,
+                None,
+                Config::default(),
+            )
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            let target = fast_socks5::util::target_addr::TargetAddr::Ip(dst);
+            socks5_stream.request(fast_socks5::Socks5Command::TCPConnect, target)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            let _ = tokio::io::copy_bidirectional(&mut local, &mut socks5_stream).await;
+            return Ok(());
+        }
+    }
+
+    // 非 Windows 或无绑定地址时：直接连接
     let mut remote = Socks5Stream::connect(socks5.to_string(), dst.ip().to_string(), dst.port(), Config::default())
         .await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
@@ -221,7 +259,28 @@ async fn handle_tcp(mut local: netstack_smoltcp::TcpStream, dst: SocketAddr, soc
 }
 
 async fn forward_udp(payload: &[u8], dst: SocketAddr) -> std::io::Result<Vec<u8>> {
+    // Windows: 绑定到物理网卡 IP，防止 UDP 走 TUN 回环
+    #[cfg(windows)]
+    let socket = {
+        if let Some(bind_ip) = tun::win::get_bind_address() {
+            let bind_addr: SocketAddr = format!("{}:0", bind_ip).parse().unwrap();
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            sock.bind(&socket2::SockAddr::from(bind_addr))?;
+            sock.set_nonblocking(true)?;
+            let std_socket: std::net::UdpSocket = sock.into();
+            tokio::net::UdpSocket::from_std(std_socket)?
+        } else {
+            tokio::net::UdpSocket::bind("0.0.0.0:0").await?
+        }
+    };
+
+    #[cfg(not(windows))]
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+
     socket.send_to(payload, dst).await?;
     let mut buf = vec![0u8; 4096];
     let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv_from(&mut buf))
