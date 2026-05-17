@@ -2,3 +2,8 @@
 .DS_Store
 xcuserdata/
 *.xcuserstate
+android/.gradle/
+android/app/build/
+android/build/
+android/app/src/main/jniLibs/
+*.apk

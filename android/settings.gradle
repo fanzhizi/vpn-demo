@@ -1,0 +1,2 @@
+rootProject.name = 'VPNDemo'
+include ':app'

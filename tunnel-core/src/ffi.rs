@@ -18,6 +18,111 @@ use log::{info, warn, error};
 
 use crate::TunnelConfig;
 
+/// Protect a socket fd from VPN routing (Android only).
+/// Follows the same pattern as leaf (eycorsican/leaf):
+///   RwLock<JavaVM> + RwLock<GlobalRef> + attach_current_thread_permanently
+#[cfg(target_os = "android")]
+pub mod android_protect {
+    use std::os::unix::io::RawFd;
+    use std::sync::RwLock;
+    use jni::objects::{GlobalRef, JValue};
+    use jni::JavaVM;
+    use log::{info, warn};
+
+    static JVM: RwLock<Option<JavaVM>> = RwLock::new(None);
+    static PROTECT_CALLBACK: RwLock<Option<ProtectCallback>> = RwLock::new(None);
+
+    struct ProtectCallback {
+        class: GlobalRef,
+        method: String,
+    }
+
+    pub fn set_jvm(vm: JavaVM) {
+        *JVM.write().unwrap() = Some(vm);
+    }
+
+    pub fn set_protect_callback(class: GlobalRef, method: String) {
+        info!("set_protect_callback: method={}", method);
+        *PROTECT_CALLBACK.write().unwrap() = Some(ProtectCallback { class, method });
+    }
+
+    pub fn protect_socket(fd: RawFd) -> bool {
+        let jvm_guard = JVM.read().unwrap();
+        let Some(vm) = jvm_guard.as_ref() else {
+            warn!("protect_socket: JVM not set");
+            return false;
+        };
+
+        let cb_guard = PROTECT_CALLBACK.read().unwrap();
+        let Some(cb) = cb_guard.as_ref() else {
+            warn!("protect_socket: callback not set");
+            return false;
+        };
+
+        let mut env = match vm.attach_current_thread_permanently() {
+            Ok(env) => env,
+            Err(e) => {
+                warn!("protect_socket: attach thread failed: {}", e);
+                return false;
+            }
+        };
+
+        match env.call_method(&cb.class, &cb.method, "(I)Z", &[JValue::Int(fd as i32)]) {
+            Ok(result) => result.z().unwrap_or(false),
+            Err(e) => {
+                warn!("protect_socket: call_method failed: {}", e);
+                let _ = env.exception_clear();
+                false
+            }
+        }
+    }
+
+    /// Called by JNI when the library is loaded. Only saves JVM reference.
+    #[no_mangle]
+    pub extern "system" fn JNI_OnLoad(
+        vm: jni::JavaVM,
+        _: *mut std::ffi::c_void,
+    ) -> jni::sys::jint {
+        set_jvm(vm);
+        jni::sys::JNI_VERSION_1_6
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn protect_socket(fd: i32) -> bool {
+    android_protect::protect_socket(fd)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn protect_socket(_fd: i32) -> bool {
+    true // no-op on non-Android
+}
+
+fn init_logger() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = oslog::OsLogger::new("com.vpndemo.app.tunnel.rust")
+                .level_filter(log::LevelFilter::Debug)
+                .init();
+        }
+        #[cfg(target_os = "android")]
+        {
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Debug)
+                    .with_tag("tunnel-core"),
+            );
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = env_logger::try_init();
+        }
+    });
+}
+
 struct TunnelRuntime {
     runtime: Runtime,
     running: Arc<AtomicBool>,
@@ -29,10 +134,7 @@ static TUNNEL: OnceCell<TunnelRuntime> = OnceCell::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn tunnel_start(socks5_addr: *const c_char) -> bool {
-    // Initialize OS log for iOS
-    let _ = oslog::OsLogger::new("com.vpndemo.app.tunnel.rust")
-        .level_filter(log::LevelFilter::Debug)
-        .init();
+    init_logger();
 
     info!("tunnel_start called");
 
@@ -250,6 +352,24 @@ async fn forward_udp(
         "[::]:0".parse().unwrap()
     };
 
+    #[cfg(target_os = "android")]
+    let socket = {
+        use std::os::unix::io::AsRawFd;
+        let domain = if dst_addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        let fd = sock.as_raw_fd();
+        protect_socket(fd);
+        sock.bind(&socket2::SockAddr::from(local_addr))?;
+        sock.set_nonblocking(true)?;
+        let std_socket: std::net::UdpSocket = sock.into();
+        TokioUdpSocket::from_std(std_socket)?
+    };
+
+    #[cfg(not(target_os = "android"))]
     let socket = TokioUdpSocket::bind(local_addr).await?;
     socket.send_to(payload, dst_addr).await?;
 
@@ -274,6 +394,55 @@ async fn handle_tcp_via_socks5(
 
     info!("Connecting via SOCKS5 {} to {}", socks5_addr, dst_addr);
 
+    // On Android: create socket -> protect it -> then connect to SOCKS5
+    // Must protect BEFORE connect, otherwise the SYN goes through TUN
+    #[cfg(target_os = "android")]
+    let mut socks5_stream = {
+        use fast_socks5::Socks5Command;
+        use fast_socks5::util::target_addr::TargetAddr;
+        use std::os::unix::io::{AsRawFd, IntoRawFd, FromRawFd};
+
+        // Step 1: Create raw socket
+        let domain = if socks5_addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+
+        // Step 2: Protect BEFORE connecting
+        let fd = sock.as_raw_fd();
+        let protected = protect_socket(fd);
+        info!("protect_socket(fd={}) = {}", fd, protected);
+        if !protected {
+            warn!("Failed to protect SOCKS5 TCP socket fd={}", fd);
+        }
+
+        // Step 3: Connect (this now bypasses VPN because fd is protected)
+        sock.connect(&socket2::SockAddr::from(socks5_addr))?;
+        sock.set_nonblocking(true)?;
+
+        // Step 4: Convert to tokio TcpStream
+        let std_stream: std::net::TcpStream = sock.into();
+        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+
+        let mut stream = Socks5Stream::use_stream(
+            tokio_stream,
+            None,
+            Socks5Config::default(),
+        )
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let target = TargetAddr::Ip(dst_addr);
+        stream.request(Socks5Command::TCPConnect, target)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        stream
+    };
+
+    #[cfg(not(target_os = "android"))]
     let mut socks5_stream = Socks5Stream::connect(
         socks5_addr.to_string(),
         dst_addr.ip().to_string(),
@@ -352,9 +521,7 @@ pub unsafe extern "C" fn tunnel_test_socks5(
     out_buf: *mut u8,
     out_len: usize,
 ) -> i32 {
-    let _ = oslog::OsLogger::new("com.vpndemo.app.tunnel.rust")
-        .level_filter(log::LevelFilter::Debug)
-        .init();
+    init_logger();
 
     if socks5_addr.is_null() {
         return write_result(out_buf, out_len, "socks5_addr is null");
