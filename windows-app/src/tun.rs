@@ -15,6 +15,7 @@ pub mod win {
     use log::{info, warn, error};
     use tokio::sync::mpsc;
     use windows::Win32::NetworkManagement::IpHelper::*;
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows::Win32::Networking::WinSock::*;
 
     /// 物理网卡信息，用于 SOCKS5 socket 绑定
@@ -45,28 +46,103 @@ pub mod win {
         }
     }
 
-    /// 获取物理网卡的本地 IP 地址（用于 socket 绑定）
+    /// 通过 Win32 API (GetBestRoute2) 获取物理网卡的本地 IP 地址。
+    /// 原理：查询到 8.8.8.8 的最佳路由，返回的源地址就是物理网卡 IP。
     fn get_physical_adapter_ip() -> Option<Ipv4Addr> {
-        let output = std::process::Command::new("cmd")
-            .args(["/C", "route print 0.0.0.0"])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // route print 格式: Network Netmask Gateway Interface Metric
-            if parts.len() >= 5
-                && parts[0] == "0.0.0.0"
-                && parts[1] == "0.0.0.0"
-                && parts[2] != "On-link"
-            {
-                // parts[3] 是物理网卡的 IP
-                if let Ok(ip) = parts[3].parse::<Ipv4Addr>() {
-                    return Some(ip);
-                }
+        unsafe {
+            let dest_addr = SOCKADDR_INET {
+                Ipv4: SOCKADDR_IN {
+                    sin_family: AF_INET,
+                    sin_addr: in_addr_from_ipv4(Ipv4Addr::new(8, 8, 8, 8)),
+                    sin_port: 0,
+                    sin_zero: [0; 8],
+                },
+            };
+
+            let mut best_route: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+            let mut best_source: SOCKADDR_INET = std::mem::zeroed();
+
+            let result = GetBestRoute2(
+                None,                   // 不指定接口 LUID，让系统选最佳
+                0,                      // InterfaceIndex = 0
+                None,                   // 不指定源地址
+                &dest_addr,             // 目标：8.8.8.8
+                0,                      // 无标志
+                &mut best_route,
+                &mut best_source,
+            );
+
+            if result.is_ok() {
+                let src = best_source.Ipv4.sin_addr.S_un.S_addr;
+                let octets = src.to_ne_bytes();
+                let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                info!("GetBestRoute2: physical IP = {}", ip);
+                Some(ip)
+            } else {
+                warn!("GetBestRoute2 failed: {:?}", result);
+                None
             }
         }
-        None
+    }
+
+    /// Win32 API: 设置适配器 IP 地址
+    fn set_adapter_ip(luid: u64, ip: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
+        unsafe {
+            let mut row: MIB_UNICASTIPADDRESS_ROW = std::mem::zeroed();
+            InitializeUnicastIpAddressEntry(&mut row);
+
+            row.InterfaceLuid.Value = luid;
+            row.Address.si_family = AF_INET;
+            row.Address.Ipv4.sin_addr = in_addr_from_ipv4(ip);
+            row.OnLinkPrefixLength = prefix_len;
+            row.DadState = IpDadStatePreferred;
+
+            let result = CreateUnicastIpAddressEntry(&row);
+            if result.is_ok() {
+                Ok(())
+            } else {
+                Err(format!("CreateUnicastIpAddressEntry failed: {:?}", result))
+            }
+        }
+    }
+
+    /// Win32 API: 设置适配器 DNS（通过注册表，Windows 没有专门的 DNS API）
+    fn set_adapter_dns(luid: u64, dns_servers: &[String]) -> Result<(), String> {
+        // 获取适配器 GUID（从 LUID 转换）
+        unsafe {
+            let mut luid_val: NET_LUID_LH = std::mem::zeroed();
+            luid_val.Value = luid;
+
+            let mut guid = windows::core::GUID::zeroed();
+            let result = ConvertInterfaceLuidToGuid(&luid_val, &mut guid);
+            if result.is_err() {
+                return Err(format!("ConvertInterfaceLuidToGuid failed: {:?}", result));
+            }
+
+            let guid_str = format!(
+                "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+                guid.data1, guid.data2, guid.data3,
+                guid.data4[0], guid.data4[1], guid.data4[2], guid.data4[3],
+                guid.data4[4], guid.data4[5], guid.data4[6], guid.data4[7],
+            );
+
+            // Windows DNS 通过注册表配置
+            let reg_path = format!(
+                "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\{}",
+                guid_str
+            );
+
+            let dns_value = dns_servers.join(",");
+
+            let hkey = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+            let subkey = hkey.open_subkey_with_flags(&reg_path, winreg::enums::KEY_WRITE)
+                .map_err(|e| format!("RegKey open failed: {}", e))?;
+            subkey.set_value("NameServer", &dns_value)
+                .map_err(|e| format!("RegKey set DNS failed: {}", e))?;
+
+            info!("DNS set via registry: {} -> {}", guid_str, dns_value);
+            Ok(())
+        }
     }
 
     /// Win32 API: 添加路由（绑定到 TUN 接口 LUID，接口销毁时自动清理）
@@ -132,22 +208,28 @@ pub mod win {
         let adapter_luid = adapter.get_luid();
         let luid_value: u64 = unsafe { std::mem::transmute(adapter_luid) };
 
-        // 配置 TUN IP 地址（netsh，IP 配置 API 太复杂不必要）
-        let cmd = format!(
-            "netsh interface ip set address \"{}\" static {} {}",
-            config.adapter_name, config.address,
-            prefix_to_mask(config.prefix_len)
-        );
-        let _ = std::process::Command::new("cmd").args(["/C", &cmd]).output();
+        // 通过 API 配置 TUN IP 地址
+        let tun_ip: Ipv4Addr = config.address.parse().unwrap_or(Ipv4Addr::new(10, 0, 0, 2));
+        if let Err(e) = set_adapter_ip(luid_value, tun_ip, config.prefix_len) {
+            error!("Failed to set adapter IP: {}", e);
+        } else {
+            info!("Adapter IP set to {}/{} (API)", tun_ip, config.prefix_len);
+        }
 
-        // 配置 DNS
-        for (i, dns) in config.dns.iter().enumerate() {
-            let cmd = if i == 0 {
-                format!("netsh interface ip set dns \"{}\" static {}", config.adapter_name, dns)
-            } else {
-                format!("netsh interface ip add dns \"{}\" {} index={}", config.adapter_name, dns, i + 1)
-            };
-            let _ = std::process::Command::new("cmd").args(["/C", &cmd]).output();
+        // 通过 API 配置 DNS
+        if let Err(e) = set_adapter_dns(luid_value, &config.dns) {
+            // DNS API 可能需要更高权限，回退到 netsh
+            warn!("DNS API failed ({}), falling back to netsh", e);
+            for (i, dns) in config.dns.iter().enumerate() {
+                let cmd = if i == 0 {
+                    format!("netsh interface ip set dns \"{}\" static {}", config.adapter_name, dns)
+                } else {
+                    format!("netsh interface ip add dns \"{}\" {} index={}", config.adapter_name, dns, i + 1)
+                };
+                let _ = std::process::Command::new("cmd").args(["/C", &cmd]).output();
+            }
+        } else {
+            info!("DNS configured via API");
         }
 
         // 通过 API 添加 TUN 默认路由（绑定 TUN LUID，适配器销毁时自动清理）
