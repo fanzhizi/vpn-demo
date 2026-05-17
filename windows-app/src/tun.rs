@@ -1,13 +1,7 @@
 //! Windows TUN 设备管理，基于 wintun.dll。
 //!
-//! Wintun 是 WireGuard 项目提供的高性能用户态 TUN 驱动，
-//! 不需要安装 TAP-Windows 等传统驱动。
-//!
-//! 工作流程：
-//! 1. 加载 wintun.dll
-//! 2. 创建虚拟网络适配器
-//! 3. 配置 IP 地址和路由（通过 netsh 命令）
-//! 4. 启动 Session 进行数据包收发
+//! 注意：Windows 上路由修改是系统级的，必须在 VPN 断开时清理，
+//! 否则会导致网络不可用（即使程序已退出）。
 
 #[cfg(windows)]
 pub mod win {
@@ -16,17 +10,12 @@ pub mod win {
     use log::{info, warn, error};
     use tokio::sync::mpsc;
 
-    /// TUN 设备配置
     pub struct TunConfig {
-        /// TUN 适配器名称（在网络设置中显示）
         pub adapter_name: String,
-        /// TUN 设备的 IP 地址
         pub address: String,
-        /// 子网掩码位数
         pub prefix_len: u8,
-        /// DNS 服务器
         pub dns: Vec<String>,
-        /// 需要排除的 IP（SOCKS5 服务器地址，走物理网卡）
+        /// SOCKS5 服务器 IP，需要排除在 TUN 路由之外
         pub excluded_ips: Vec<String>,
     }
 
@@ -42,41 +31,80 @@ pub mod win {
         }
     }
 
-    /// 创建 wintun 适配器并启动数据包收发。
-    ///
-    /// 返回：
-    /// - inbound_tx: 向 tunnel-core 发送从 TUN 读取的 IP 包
-    /// - outbound_rx: 从 tunnel-core 接收要写入 TUN 的 IP 包
+    /// 记录所有添加的路由，用于清理
+    struct RouteCleanup {
+        adapter_name: String,
+        excluded_ips: Vec<String>,
+        default_gateway: Option<String>,
+    }
+
+    impl RouteCleanup {
+        /// 清理所有添加的路由和适配器配置
+        fn cleanup(&self) {
+            info!("Cleaning up routes...");
+
+            // 删除 TUN 默认路由
+            let cmd = format!(
+                "netsh interface ip delete route 0.0.0.0/0 \"{}\"",
+                self.adapter_name
+            );
+            run_cmd(&cmd);
+
+            // 删除排除的 IP 路由
+            for ip in &self.excluded_ips {
+                let cmd = format!("route delete {} mask 255.255.255.255", ip);
+                run_cmd(&cmd);
+            }
+
+            // 恢复 DNS（设回 DHCP）
+            let cmd = format!(
+                "netsh interface ip set dns \"{}\" dhcp",
+                self.adapter_name
+            );
+            run_cmd(&cmd);
+
+            info!("Routes cleaned up");
+        }
+    }
+
+    impl Drop for RouteCleanup {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
     pub fn start_tun(
         config: TunConfig,
         running: Arc<AtomicBool>,
         inbound_tx: mpsc::Sender<Vec<u8>>,
         mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 加载 wintun.dll（必须在可执行文件同目录或 PATH 中）
         let wintun = unsafe { wintun::load()? };
         info!("wintun.dll loaded");
 
-        // 创建适配器（如果同名适配器已存在会复用）
         let adapter = wintun::Adapter::create(
             &wintun,
             &config.adapter_name,
             "VPNDemo Tunnel",
-            None, // 不指定 GUID，自动生成
+            None,
         )?;
         info!("Adapter '{}' created", config.adapter_name);
 
-        // 配置 IP 地址（通过 netsh 命令，最简单可靠的方式）
-        let addr_cmd = format!(
-            "netsh interface ip set address \"{}\" static {} {} gateway=none",
+        // 先获取默认网关（在添加 TUN 路由之前！）
+        let default_gateway = get_default_gateway();
+        info!("Default gateway: {:?}", default_gateway);
+
+        // 配置 IP 地址
+        let cmd = format!(
+            "netsh interface ip set address \"{}\" static {} {}",
             config.adapter_name, config.address,
             prefix_to_mask(config.prefix_len)
         );
-        run_cmd(&addr_cmd);
+        run_cmd(&cmd);
 
         // 配置 DNS
         for (i, dns) in config.dns.iter().enumerate() {
-            let dns_cmd = if i == 0 {
+            let cmd = if i == 0 {
                 format!(
                     "netsh interface ip set dns \"{}\" static {}",
                     config.adapter_name, dns
@@ -87,30 +115,49 @@ pub mod win {
                     config.adapter_name, dns, i + 1
                 )
             };
-            run_cmd(&dns_cmd);
+            run_cmd(&cmd);
         }
 
-        // 添加默认路由：所有流量走 TUN
-        let route_cmd = format!(
+        // 排除 SOCKS5 服务器 IP（必须在添加默认路由之前！）
+        // 走物理网卡的默认网关，metric 1 优先级高于 TUN 的 metric 5
+        if let Some(ref gw) = default_gateway {
+            for ip in &config.excluded_ips {
+                let cmd = format!(
+                    "route add {} mask 255.255.255.255 {} metric 1",
+                    ip, gw
+                );
+                run_cmd(&cmd);
+            }
+        } else {
+            warn!("No default gateway found, SOCKS5 exclusion may not work!");
+        }
+
+        // 添加默认路由：所有流量走 TUN（metric 5，低于排除路由的 metric 1）
+        let cmd = format!(
             "netsh interface ip add route 0.0.0.0/0 \"{}\" {} metric=5",
             config.adapter_name, config.address
         );
-        run_cmd(&route_cmd);
+        run_cmd(&cmd);
 
-        // 排除 SOCKS5 服务器的 IP（走物理网卡，防止回环）
-        // Windows 没有 protect(fd)，需要通过路由表排除
-        for ip in &config.excluded_ips {
-            // 获取默认网关
-            if let Some(gateway) = get_default_gateway() {
-                let exclude_cmd = format!(
-                    "route add {} mask 255.255.255.255 {} metric 1",
-                    ip, gateway
-                );
-                run_cmd(&exclude_cmd);
+        // 创建路由清理器（Drop 时自动清理）
+        let route_cleanup = Arc::new(std::sync::Mutex::new(Some(RouteCleanup {
+            adapter_name: config.adapter_name.clone(),
+            excluded_ips: config.excluded_ips.clone(),
+            default_gateway: default_gateway.clone(),
+        })));
+
+        // 注册 Ctrl+C 清理（防止异常退出时路由残留）
+        let cleanup_ctrlc = route_cleanup.clone();
+        let _ = ctrlc::set_handler(move || {
+            if let Ok(mut guard) = cleanup_ctrlc.lock() {
+                if let Some(cleanup) = guard.take() {
+                    cleanup.cleanup();
+                }
             }
-        }
+            std::process::exit(0);
+        });
 
-        // 启动 wintun session（ring buffer 大小 0x400000 = 4MB）
+        // 启动 wintun session
         let session = Arc::new(adapter.start_session(0x400000)?);
         info!("Wintun session started");
 
@@ -120,7 +167,6 @@ pub mod win {
         std::thread::spawn(move || {
             let mut count: u64 = 0;
             while running_read.load(Ordering::SeqCst) {
-                // 阻塞等待一个 IP 包（最多等 1 秒）
                 match session_read.receive_blocking() {
                     Ok(packet) => {
                         count += 1;
@@ -144,6 +190,7 @@ pub mod win {
         // 写线程：tunnel-core → TUN
         let session_write = session.clone();
         let running_write = running.clone();
+        let cleanup_write = route_cleanup.clone();
         std::thread::spawn(move || {
             let mut count: u64 = 0;
             while running_write.load(Ordering::SeqCst) {
@@ -153,7 +200,6 @@ pub mod win {
                         if count <= 5 || count % 500 == 0 {
                             info!("TUN write #{}: {} bytes", count, data.len());
                         }
-                        // 分配 wintun 发送缓冲区并拷贝数据
                         match session_write.allocate_send_packet(data.len() as u16) {
                             Ok(mut send_packet) => {
                                 send_packet.bytes_mut().copy_from_slice(&data);
@@ -168,12 +214,18 @@ pub mod win {
                 }
             }
             info!("TUN write thread ended, packets={}", count);
+
+            // 写线程结束时清理路由
+            if let Ok(mut guard) = cleanup_write.lock() {
+                if let Some(cleanup) = guard.take() {
+                    cleanup.cleanup();
+                }
+            }
         });
 
         Ok(())
     }
 
-    /// 前缀长度转子网掩码字符串
     fn prefix_to_mask(prefix: u8) -> String {
         let mask: u32 = if prefix >= 32 {
             0xFFFFFFFF
@@ -189,7 +241,6 @@ pub mod win {
         )
     }
 
-    /// 执行系统命令
     fn run_cmd(cmd: &str) {
         info!("Running: {}", cmd);
         let output = std::process::Command::new("cmd")
@@ -199,24 +250,29 @@ pub mod win {
             Ok(o) => {
                 if !o.status.success() {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    warn!("Command failed: {}", stderr.trim());
+                    if !stderr.trim().is_empty() {
+                        warn!("Command stderr: {}", stderr.trim());
+                    }
                 }
             }
             Err(e) => error!("Failed to run command: {}", e),
         }
     }
 
-    /// 获取默认网关 IP（通过解析 route print）
     fn get_default_gateway() -> Option<String> {
         let output = std::process::Command::new("cmd")
             .args(["/C", "route print 0.0.0.0"])
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
-        // 解析 route print 输出找默认网关
         for line in text.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
+            // route print 格式: Network  Netmask  Gateway  Interface  Metric
+            if parts.len() >= 5
+                && parts[0] == "0.0.0.0"
+                && parts[1] == "0.0.0.0"
+                && parts[2] != "On-link"
+            {
                 return Some(parts[2].to_string());
             }
         }
