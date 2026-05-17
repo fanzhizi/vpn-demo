@@ -43,12 +43,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let ipv4 = NEIPv4Settings(addresses: ["10.0.0.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        // Exclude the SOCKS5 server from tunnel to avoid routing loop
-        if let host = socks5Address.split(separator: ":").first {
-            let excludeRoute = NEIPv4Route(destinationAddress: String(host), subnetMask: "255.255.255.255")
-            ipv4.excludedRoutes = [excludeRoute]
-            os_log("Excluding route: %{public}@", log: log, type: .info, String(host))
-        }
+        // No excludedRoutes needed for the proxy server IP:
+        // iOS NE Extension process sockets automatically bypass the TUN
+        // (system-level isolation, unlike Android which needs protect(fd))
         settings.ipv4Settings = ipv4
 
         settings.dnsSettings = NEDNSSettings(servers: ["8.8.8.8", "8.8.4.4"])
